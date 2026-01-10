@@ -30,7 +30,7 @@ MCprobe is designed for speed and scalability:
 
 ---
 
-## 📊 Benchmark
+## Benchmark
 
 - **Total IPs scanned:** 150,000
 - **Time:** ~8 minutes
