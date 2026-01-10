@@ -64,9 +64,10 @@ Example Output:
 ---
 
 ## Usage
-
-cargo run --release
-./target/release/mcprobe
+Build
+- cargo run --release
+Run
+- ./target/release/mcprobe
 
 ---
 
