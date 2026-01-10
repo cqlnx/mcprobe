@@ -49,7 +49,7 @@ results.json
 - Structured JSON scan results
 
 Example Output:
-(see assets/image.png)
+![Example results.json output](assets/image.png)
 
 ---
 
