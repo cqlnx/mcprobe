@@ -66,6 +66,7 @@ Example Output:
 ## Usage
 Build
 - cargo run --release
+  
 Run
 - ./target/release/mcprobe
 
