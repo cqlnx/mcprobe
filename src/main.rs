@@ -1,13 +1,3 @@
-// Cargo.toml dependencies:
-// [dependencies]
-// tokio = { version = "1", features = ["full"] }
-// serde = { version = "1.0", features = ["derive"] }
-// serde_json = "1.0"
-// futures = "0.3"
-// anyhow = "1.0"
-// indicatif = "0.17"
-// flate2 = "1.0"
-
 use anyhow::{anyhow, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
