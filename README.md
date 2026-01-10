@@ -67,6 +67,8 @@ Example Output:
 
 cargo run --release
 
+./target/release/mcprobe
+
 ---
 
 ## Disclaimer
