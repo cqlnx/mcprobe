@@ -1,6 +1,6 @@
 # MCprobe
 
-High-performance Minecraft server scanner and protocol prober
+Blazingly fast Minecraft server scanner and protocol prober
 MCprobe scans Minecraft servers using the native Minecraft protocol to efficiently collect server metadata at scale.
 
 ---
