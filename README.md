@@ -18,7 +18,7 @@ Scans servers to collect:
 
 ---
 
-## ⚡ Performance & Design
+## Performance & Design
 
 MCprobe is designed for speed and scalability:
 - Written in async Rust using Tokio
@@ -30,7 +30,7 @@ MCprobe is designed for speed and scalability:
 
 ---
 
-## 📥 Input
+## Input
 
 input.txt
 - One IP per line
@@ -43,7 +43,7 @@ play.example.com:25566
 
 ---
 
-## 📤 Output
+## Output
 
 results.json
 - Structured JSON scan results
@@ -53,12 +53,12 @@ Example Output:
 
 ---
 
-## ▶️ Usage
+## Usage
 
 cargo run --release
 
 ---
 
-## ⚠️ Disclaimer
+## Disclaimer
 
 Users are responsible for ensuring compliance with local laws and regulations when scanning servers.
