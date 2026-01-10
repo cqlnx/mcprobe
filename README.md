@@ -16,6 +16,9 @@ Input:
 
 Output:
 - results.json (structured scan results)
+  
+### Example Output
+![Example results.json output](assets/image.png)
 
 Usage:
 cargo run --release
