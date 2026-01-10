@@ -1,11 +1,6 @@
 # MCprobe
 
 High-performance Minecraft server scanner and protocol prober
-**Benchmarked performance:**
-- Scanned **150,000 servers in ~8 minutes**
-- **Authentication mode detection enabled**
-- **500 concurrent scans**
-  
 MCprobe scans Minecraft servers using the native Minecraft protocol to efficiently collect server metadata at scale.
 
 ---
@@ -34,6 +29,17 @@ MCprobe is designed for speed and scalability:
   - Connection timeouts
 
 ---
+
+## 📊 Benchmark
+
+- **Total IPs scanned:** 150,000
+- **Time:** ~8 minutes
+- **Concurrency:** 500
+- **Protocol:** Native Minecraft handshake
+- **Auth mode detection:** Online / Offline / Whitelist
+
+### Terminal Output
+![150k scan in 8 minutes](assets/terminal.png)
 
 ## Input
 
