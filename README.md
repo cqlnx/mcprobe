@@ -39,7 +39,6 @@ input.txt
 
 Example:
 127.0.0.1
-play.example.com:25566
 
 ---
 
