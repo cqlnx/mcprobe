@@ -47,8 +47,9 @@ play.example.com:25566
 
 results.json
 - Structured JSON scan results
-
+  
 Example Output:
+
 ![Example results.json output](assets/image.png)
 
 ---
