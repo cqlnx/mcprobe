@@ -36,7 +36,7 @@ MCprobe is designed for speed and scalability:
 - **Total IPs scanned:** 150,000
 - **Time:** ~8 minutes
 - **Concurrency:** 500
-- **Auth mode detection:** true
+- **Auth mode detection:** true (if false up to 2x faster)
 
 ### Terminal Output
 ![150k scan in 8 minutes](assets/terminal.png)
