@@ -9,7 +9,7 @@ MCprobe scans Minecraft servers using the native Minecraft protocol to efficient
 ## Features
 
 Scans servers to collect:
-- MOTD and favicon
+- MOTD
 - Version and protocol
 - Player counts and sample players
 - Authentication mode
