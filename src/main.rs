@@ -11,11 +11,14 @@ use tokio::time::timeout;
 use flate2::read::ZlibDecoder;
 use std::io::Read;
 
+// Timeout configs - feel free to adjust these
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
-const PROTOCOL_VERSION: i32 = 763; // 1.20.1 - used for initial status check
-const MAX_PROTOCOL_VERSION: i32 = 800; // Support up to future versions
-const MIN_PROTOCOL_VERSION: i32 = 47;  // 1.8+
+
+// MC protocol versions we support
+const PROTOCOL_VERSION: i32 = 763; // 1.20.1
+const MAX_PROTOCOL_VERSION: i32 = 800;
+const MIN_PROTOCOL_VERSION: i32 = 47; // Anything older than 1.8 is pretty rare
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ScanResult {
@@ -36,7 +39,7 @@ struct ScanResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     favicon: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    auth_mode: Option<i32>, // -1 = unknown, 0 = offline, 1 = online, 2 = whitelist
+    auth_mode: Option<i32>, // -1=unknown, 0=cracked, 1=premium, 2=whitelisted
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -79,117 +82,100 @@ struct PlayerSample {
     id: String,
 }
 
-// VarInt encoding/decoding
-fn encode_varint(mut value: i32) -> Vec<u8> {
-    let mut result = Vec::new();
+// VarInt stuff - standard MC protocol encoding
+fn encode_varint(mut val: i32) -> Vec<u8> {
+    let mut buf = Vec::new();
     loop {
-        let mut temp = (value & 0x7F) as u8;
-        value >>= 7;
-        if value != 0 {
-            temp |= 0x80;
+        let mut byte = (val & 0x7F) as u8;
+        val >>= 7;
+        if val != 0 {
+            byte |= 0x80;
         }
-        result.push(temp);
-        if value == 0 {
+        buf.push(byte);
+        if val == 0 {
             break;
         }
     }
-    result
+    buf
 }
 
 async fn read_varint(stream: &mut TcpStream) -> Result<i32> {
     let mut result = 0i32;
     let mut shift = 0;
     
-    for _ in 0..5 {
-        let byte = stream.read_u8().await?;
-        result |= ((byte & 0x7F) as i32) << shift;
+    for i in 0..5 {
+        let b = stream.read_u8().await?;
+        result |= ((b & 0x7F) as i32) << shift;
         
-        if byte & 0x80 == 0 {
+        if b & 0x80 == 0 {
             return Ok(result);
         }
         
         shift += 7;
     }
     
-    Err(anyhow!("VarInt too long"))
+    Err(anyhow!("VarInt is way too long"))
 }
 
-fn encode_string(s: &str) -> Vec<u8> {
-    let bytes = s.as_bytes();
-    let mut result = encode_varint(bytes.len() as i32);
-    result.extend_from_slice(bytes);
-    result
+fn encode_string(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut buf = encode_varint(bytes.len() as i32);
+    buf.extend_from_slice(bytes);
+    buf
 }
 
+// Creates the initial handshake packet
 fn create_handshake_packet(host: &str, port: u16, next_state: i32, protocol: i32) -> Vec<u8> {
     let mut data = Vec::new();
     
-    // Packet ID (0x00 for handshake)
-    data.extend_from_slice(&encode_varint(0x00));
-    
-    // Protocol version
+    data.extend_from_slice(&encode_varint(0x00)); // packet id
     data.extend_from_slice(&encode_varint(protocol));
-    
-    // Server address
     data.extend_from_slice(&encode_string(host));
-    
-    // Server port
     data.extend_from_slice(&port.to_be_bytes());
-    
-    // Next state (1 = status, 2 = login)
     data.extend_from_slice(&encode_varint(next_state));
     
-    // Prepend packet length
+    // prepend the length
     let mut packet = encode_varint(data.len() as i32);
     packet.extend_from_slice(&data);
-    
     packet
 }
 
 fn create_status_request() -> Vec<u8> {
-    vec![0x01, 0x00] // Length: 1, Packet ID: 0x00
+    vec![0x01, 0x00]
 }
 
+// Login packet - has to handle different protocol versions because Mojang
 fn create_login_start(username: &str, uuid: &str, protocol: i32) -> Vec<u8> {
     let mut data = Vec::new();
     
-    // Packet ID (0x00 for login start)
-    data.extend_from_slice(&encode_varint(0x00));
-    
-    // Username
+    data.extend_from_slice(&encode_varint(0x00)); // login start packet id
     data.extend_from_slice(&encode_string(username));
     
-    // UUID handling based on protocol version
+    // Different versions want different data formats
     if protocol >= 47 && protocol <= 758 {
-        // 1.8 - 1.18.2: username only
-        // No additional fields needed
+        // 1.8 to 1.18.2 - just username
     } else if protocol == 759 {
-        // 1.19 (759): username + Has Sig Data (boolean)
-        data.push(0x00); // Has Sig Data = false
+        // 1.19 added signature stuff
+        data.push(0x00); // no signature data
     } else if protocol == 760 {
-        // 1.19.2 (760): username + Has Sig Data (boolean) + has UUID (boolean) + UUID (optional)
-        data.push(0x00); // Has Sig Data = false
-        data.push(0x01); // has UUID = true
+        // 1.19.2 - signature + optional uuid
+        data.push(0x00); // no sig
+        data.push(0x01); // has uuid
         let uuid_bytes = parse_uuid(uuid);
         data.extend_from_slice(&uuid_bytes);
     } else if protocol >= 761 && protocol <= 763 {
-        // 1.19.3 - 1.20.1 (761-763): username + has UUID (boolean) + UUID (optional)
-        data.push(0x01); // has UUID = true
+        // 1.19.3 to 1.20.1
+        data.push(0x01); // has uuid
         let uuid_bytes = parse_uuid(uuid);
         data.extend_from_slice(&uuid_bytes);
     } else if protocol >= 764 {
-        // 1.20.2+ (764+): username + UUID (always present)
+        // 1.20.2+ always requires uuid
         let uuid_bytes = parse_uuid(uuid);
         data.extend_from_slice(&uuid_bytes);
-    } else {
-        // Unknown/very old protocol, try username only
-        // This handles protocols < 47 (pre-1.8)
     }
     
-    // Prepend packet length
     let mut packet = encode_varint(data.len() as i32);
     packet.extend_from_slice(&data);
-    
     packet
 }
 
@@ -201,8 +187,9 @@ fn parse_uuid(uuid: &str) -> Vec<u8> {
         .collect()
 }
 
-fn parse_motd(description: &serde_json::Value) -> String {
-    match description {
+// Parse MOTD - servers can send this in multiple formats
+fn parse_motd(desc: &serde_json::Value) -> String {
+    match desc {
         serde_json::Value::String(s) => strip_color_codes(s),
         serde_json::Value::Object(obj) => {
             let mut motd = String::new();
@@ -257,235 +244,176 @@ fn parse_extra(extra: &serde_json::Value) -> String {
     }
 }
 
-fn strip_color_codes(s: &str) -> String {
+// Remove minecraft color codes (§c, §l, etc)
+fn strip_color_codes(text: &str) -> String {
     let mut result = String::new();
-    let mut chars = s.chars();
+    let mut chars = text.chars();
     
-    while let Some(c) = chars.next() {
-        if c == '§' {
-            chars.next(); // Skip next character
+    while let Some(ch) = chars.next() {
+        if ch == '§' {
+            chars.next(); // skip the color code
         } else {
-            result.push(c);
+            result.push(ch);
         }
     }
     
     result
 }
 
+// Get basic server info
 async fn get_server_status(host: &str, port: u16) -> Result<ServerResponse> {
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     let mut stream = timeout(DEFAULT_TIMEOUT, TcpStream::connect(addr)).await??;
     
-    // Send handshake - use high protocol version so server responds with its actual version
-    let handshake = create_handshake_packet(host, port, 1, MAX_PROTOCOL_VERSION); // 1 = status
+    // Send handshake with high protocol so server tells us its real version
+    let handshake = create_handshake_packet(host, port, 1, MAX_PROTOCOL_VERSION);
     stream.write_all(&handshake).await?;
     stream.flush().await?;
     
-    // Send status request
-    let status_request = create_status_request();
-    stream.write_all(&status_request).await?;
+    // Ask for status
+    let status_req = create_status_request();
+    stream.write_all(&status_req).await?;
     stream.flush().await?;
     
-    // Read response
-    let _packet_length = read_varint(&mut stream).await?;
-    let _packet_id = read_varint(&mut stream).await?;
-    let json_length = read_varint(&mut stream).await?;
+    // Read the response
+    let _pkt_len = read_varint(&mut stream).await?;
+    let _pkt_id = read_varint(&mut stream).await?;
+    let json_len = read_varint(&mut stream).await?;
     
-    let mut json_data = vec![0u8; json_length as usize];
+    let mut json_data = vec![0u8; json_len as usize];
     stream.read_exact(&mut json_data).await?;
     
     let response: ServerResponse = serde_json::from_slice(&json_data)?;
-    
     Ok(response)
 }
 
 async fn get_auth_mode(host: &str, port: u16, protocol: i32) -> Result<i32> {
-    // Validate protocol version is in supported range
     if protocol < MIN_PROTOCOL_VERSION {
-        return Err(anyhow!("Protocol version {} too old (< 1.8)", protocol));
+        return Err(anyhow!("Protocol {} is too old, can't check", protocol));
     }
     
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     let mut stream = timeout(DEFAULT_TIMEOUT, TcpStream::connect(addr)).await??;
     
-    // Send handshake with the actual server's protocol version
-    let handshake = create_handshake_packet(host, port, 2, protocol); // 2 = login
+    let handshake = create_handshake_packet(host, port, 2, protocol);
     stream.write_all(&handshake).await?;
     stream.flush().await?;
     
-    // Send login start with proper protocol-specific format
-    let login_start = create_login_start("popiiumaa", "00000000-0000-0000-0000-000000000000", protocol);
-    stream.write_all(&login_start).await?;
+    let login = create_login_start("popiiumaa", "00000000-0000-0000-0000-000000000000", protocol);
+    stream.write_all(&login).await?;
     stream.flush().await?;
     
-    // Track if compression is enabled
-    let mut compression_threshold: i32 = -1;
+    let mut compression = -1;
     
-    // Read response with timeout
     let result = timeout(AUTH_TIMEOUT, async {
         loop {
-            // Read packet length
-            let packet_length = read_varint(&mut stream).await?;
-            if packet_length <= 0 {
-                continue;
-            }
+            let pkt_len = read_varint(&mut stream).await?;
+            if pkt_len <= 0 { continue; }
             
-            // Read the entire packet data
-            let mut packet_data = vec![0u8; packet_length as usize];
-            stream.read_exact(&mut packet_data).await?;
+            let mut pkt_data = vec![0u8; pkt_len as usize];
+            stream.read_exact(&mut pkt_data).await?;
             
-            // Handle compression if enabled
-            let packet_bytes = if compression_threshold >= 0 {
-                // Read the data length varint from packet_data
-                let mut cursor = 0;
-                let mut data_length = 0i32;
-                let mut shift = 0;
+            let pkt_bytes = if compression >= 0 {
+                let mut pos = 0;
+                let mut dlen = 0i32;
+                let mut bits = 0;
                 
-                for i in 0..5 {
-                    if cursor >= packet_data.len() {
-                        return Err(anyhow!("Incomplete compressed packet"));
+                for _ in 0..5 {
+                    if pos >= pkt_data.len() {
+                        return Err(anyhow!("bad compressed packet"));
                     }
-                    let byte = packet_data[cursor];
-                    cursor += 1;
-                    data_length |= ((byte & 0x7F) as i32) << shift;
-                    if byte & 0x80 == 0 {
-                        break;
-                    }
-                    shift += 7;
-                    if i == 4 {
-                        return Err(anyhow!("Data length varint too long"));
-                    }
+                    let b = pkt_data[pos];
+                    pos += 1;
+                    dlen |= ((b & 0x7F) as i32) << bits;
+                    if b & 0x80 == 0 { break; }
+                    bits += 7;
                 }
                 
-                if data_length == 0 {
-                    // Not compressed, use as-is
-                    packet_data[cursor..].to_vec()
+                if dlen == 0 {
+                    pkt_data[pos..].to_vec()
                 } else {
-                    // Decompress
-                    let compressed_data = &packet_data[cursor..];
-                    let mut decoder = ZlibDecoder::new(compressed_data);
-                    let mut decompressed = Vec::new();
-                    decoder.read_to_end(&mut decompressed)
-                        .map_err(|e| anyhow!("Decompression failed: {}", e))?;
-                    decompressed
+                    let mut decoder = ZlibDecoder::new(&pkt_data[pos..]);
+                    let mut out = Vec::new();
+                    decoder.read_to_end(&mut out)?;
+                    out
                 }
             } else {
-                packet_data
+                pkt_data
             };
             
-            // Read packet ID from decompressed/uncompressed data
-            if packet_bytes.is_empty() {
-                continue;
+            if pkt_bytes.is_empty() { continue; }
+            
+            let mut pos = 0;
+            let mut id = 0i32;
+            let mut bits = 0;
+            
+            for _ in 0..5 {
+                if pos >= pkt_bytes.len() { 
+                    return Err(anyhow!("bad packet"));
+                }
+                let b = pkt_bytes[pos];
+                pos += 1;
+                id |= ((b & 0x7F) as i32) << bits;
+                if b & 0x80 == 0 { break; }
+                bits += 7;
             }
             
-            let mut cursor = 0;
-            let mut packet_id = 0i32;
-            let mut shift = 0;
-            
-            for i in 0..5 {
-                if cursor >= packet_bytes.len() {
-                    return Err(anyhow!("Incomplete packet"));
-                }
-                let byte = packet_bytes[cursor];
-                cursor += 1;
-                packet_id |= ((byte & 0x7F) as i32) << shift;
-                if byte & 0x80 == 0 {
-                    break;
-                }
-                shift += 7;
-                if i == 4 {
-                    return Err(anyhow!("Packet ID varint too long"));
-                }
-            }
-            
-            match packet_id {
+            match id {
                 0x00 => {
-                    // Disconnect/Kick
-                    if cursor < packet_bytes.len() {
-                        // Read string length
-                        let mut string_len = 0i32;
-                        let mut shift = 0;
-                        for i in 0..5 {
-                            if cursor >= packet_bytes.len() {
-                                break;
-                            }
-                            let byte = packet_bytes[cursor];
-                            cursor += 1;
-                            string_len |= ((byte & 0x7F) as i32) << shift;
-                            if byte & 0x80 == 0 {
-                                break;
-                            }
-                            shift += 7;
-                            if i == 4 {
-                                break;
-                            }
+                    // kick/disconnect
+                    if pos < pkt_bytes.len() {
+                        let mut slen = 0i32;
+                        let mut bits = 0;
+                        for _ in 0..5 {
+                            if pos >= pkt_bytes.len() { break; }
+                            let b = pkt_bytes[pos];
+                            pos += 1;
+                            slen |= ((b & 0x7F) as i32) << bits;
+                            if b & 0x80 == 0 { break; }
+                            bits += 7;
                         }
                         
-                        // Read the JSON string
-                        if string_len > 0 && cursor + string_len as usize <= packet_bytes.len() {
-                            let json_bytes = &packet_bytes[cursor..cursor + string_len as usize];
-                            if let Ok(json_str) = std::str::from_utf8(json_bytes) {
-                                let lower = json_str.to_lowercase();
-                                if lower.contains("whitelist") || lower.contains("not whitelisted") {
-                                    return Ok(2); // Whitelist
+                        if slen > 0 && pos + slen as usize <= pkt_bytes.len() {
+                            if let Ok(msg) = std::str::from_utf8(&pkt_bytes[pos..pos + slen as usize]) {
+                                if msg.to_lowercase().contains("whitelist") {
+                                    return Ok(2);
                                 }
                             }
                         }
                     }
-                    return Ok(2); // Assume whitelist
+                    return Ok(2);
                 }
-                0x01 => {
-                    // Encryption Request = online mode
-                    return Ok(1);
-                }
-                0x02 => {
-                    // Login Success = offline mode
-                    return Ok(0);
-                }
+                0x01 => return Ok(1), // encryption = online
+                0x02 => return Ok(0), // success = cracked
                 0x03 => {
-                    // Set Compression
-                    let mut threshold = 0i32;
-                    let mut shift = 0;
-                    for i in 0..5 {
-                        if cursor >= packet_bytes.len() {
-                            break;
-                        }
-                        let byte = packet_bytes[cursor];
-                        cursor += 1;
-                        threshold |= ((byte & 0x7F) as i32) << shift;
-                        if byte & 0x80 == 0 {
-                            break;
-                        }
-                        shift += 7;
-                        if i == 4 {
-                            break;
-                        }
+                    // compression enabled
+                    let mut thresh = 0i32;
+                    let mut bits = 0;
+                    for _ in 0..5 {
+                        if pos >= pkt_bytes.len() { break; }
+                        let b = pkt_bytes[pos];
+                        pos += 1;
+                        thresh |= ((b & 0x7F) as i32) << bits;
+                        if b & 0x80 == 0 { break; }
+                        bits += 7;
                     }
-                    compression_threshold = threshold;
-                    continue;
+                    compression = thresh;
                 }
-                0x04 => {
-                    // Login Plugin Request - continue
-                    continue;
-                }
-                _ => {
-                    continue;
-                }
+                _ => {} // ignore other packets
             }
         }
     })
     .await;
     
     match result {
-        Ok(mode) => mode,
+        Ok(m) => m,
         Err(_) => Ok(-1),
     }
 }
 
 async fn scan_server(ip: String, port: u16, check_auth: bool) -> ScanResult {
-    // Wrap entire scan in timeout to prevent hanging
     let scan_result = timeout(Duration::from_secs(10), async {
-        let mut result = ScanResult {
+        let mut res = ScanResult {
             ip: ip.clone(),
             port,
             motd: None,
@@ -499,204 +427,140 @@ async fn scan_server(ip: String, port: u16, check_auth: bool) -> ScanResult {
             error: None,
         };
         
-        // Get status
         match get_server_status(&ip, port).await {
-            Ok(response) => {
-                if let Some(version) = response.version {
-                    result.version = Some(version.name);
-                    result.protocol = Some(version.protocol);
+            Ok(resp) => {
+                if let Some(v) = resp.version {
+                    res.version = Some(v.name);
+                    res.protocol = Some(v.protocol);
                 }
                 
-                if let Some(players) = response.players {
-                    result.max_players = Some(players.max);
-                    result.online_players = Some(players.online);
+                if let Some(p) = resp.players {
+                    res.max_players = Some(p.max);
+                    res.online_players = Some(p.online);
                     
-                    if let Some(sample) = players.sample {
-                        result.players = Some(
-                            sample
-                                .into_iter()
-                                .map(|p| Player {
-                                    name: p.name,
-                                    uuid: p.id,
-                                })
-                                .collect(),
+                    if let Some(sample) = p.sample {
+                        res.players = Some(
+                            sample.into_iter()
+                                .map(|p| Player { name: p.name, uuid: p.id })
+                                .collect()
                         );
                     }
                 }
                 
-                if let Some(description) = response.description {
-                    result.motd = Some(parse_motd(&description));
+                if let Some(d) = resp.description {
+                    res.motd = Some(parse_motd(&d));
                 }
                 
-                result.favicon = response.favicon;
+                res.favicon = resp.favicon;
                 
-                // Get auth mode if requested
-                if check_auth {
-                    if let Some(protocol) = result.protocol {
-                        // Only attempt auth check for supported protocols
-                        if protocol >= MIN_PROTOCOL_VERSION {
-                            match get_auth_mode(&ip, port, protocol).await {
-                                Ok(auth_mode) => result.auth_mode = Some(auth_mode),
-                                Err(_) => {
-                                    result.auth_mode = Some(-1);
-                                }
-                            }
-                        } else {
-                            // Protocol too old (< 1.8)
-                            result.auth_mode = Some(-1);
-                        }
+                if check_auth && res.protocol.is_some() {
+                    let proto = res.protocol.unwrap();
+                    if proto >= MIN_PROTOCOL_VERSION {
+                        res.auth_mode = Some(get_auth_mode(&ip, port, proto).await.unwrap_or(-1));
                     } else {
-                        // No protocol info available
-                        result.auth_mode = Some(-1);
+                        res.auth_mode = Some(-1);
                     }
                 }
             }
-            Err(e) => {
-                result.error = Some(e.to_string());
-            }
+            Err(e) => res.error = Some(e.to_string()),
         }
-        result
-    })
-    .await;
+        res
+    }).await;
     
-    match scan_result {
-        Ok(r) => r,
-        Err(_) => ScanResult {
-            ip,
-            port,
-            motd: None,
-            version: None,
-            protocol: None,
-            max_players: None,
-            online_players: None,
-            players: None,
-            favicon: None,
-            auth_mode: None,
-            error: Some("Scan timeout".to_string()),
-        },
-    }
+    scan_result.unwrap_or_else(|_| ScanResult {
+        ip, port,
+        motd: None, version: None, protocol: None,
+        max_players: None, online_players: None, players: None,
+        favicon: None, auth_mode: None,
+        error: Some("Timeout".to_string()),
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Read input file
     let input = tokio::fs::read_to_string("input.txt").await?;
-    let lines: Vec<String> = input
-        .lines()
+    let lines: Vec<String> = input.lines()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && !s.starts_with('#'))
         .collect();
     
     println!("🔍 Minecraft Server Scanner");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("📊 Total servers to scan: {}", lines.len());
+    println!("📊 Found {} servers to scan", lines.len());
     println!();
     
-    let check_auth = true; // Set to false to skip auth mode detection (faster)
-    let concurrent_scans = 500; // Increas for faster scans
+    let check_auth = false;
+    let max_concurrent = 500;
     
-    // Setup progress bars
-    let multi_progress = MultiProgress::new();
-    let main_pb = multi_progress.add(ProgressBar::new(lines.len() as u64));
-    main_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}")
-            .unwrap()
-            .progress_chars("█▓▒░"),
-    );
+    let mp = MultiProgress::new();
+    let pb = mp.add(ProgressBar::new(lines.len() as u64));
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}").unwrap()
+        .progress_chars("█▓▒░"));
     
-    let stats_pb = multi_progress.add(ProgressBar::new(0));
-    stats_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("   ✓ {msg}")
-            .unwrap()
-    );
+    let status = mp.add(ProgressBar::new(0));
+    status.set_style(ProgressStyle::default_bar().template("   ✓ {msg}").unwrap());
     
-    // Semaphore to limit concurrent scans
-    let semaphore = Arc::new(Semaphore::new(concurrent_scans));
-    
-    let mut handles = Vec::new();
-    let mut results = Vec::new();
+    let sem = Arc::new(Semaphore::new(max_concurrent));
+    let mut tasks = Vec::new();
     
     for line in lines {
-        // Parse IP:PORT or just IP (default to 25565)
-        let (ip, port) = if let Some((host, port_str)) = line.split_once(':') {
-            (host.to_string(), port_str.parse().unwrap_or(25565))
-        } else {
-            (line.clone(), 25565)
+        let (ip, port) = match line.split_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().unwrap_or(25565)),
+            None => (line.clone(), 25565)
         };
         
-        let semaphore = Arc::clone(&semaphore);
-        let pb = main_pb.clone();
-        let stats = stats_pb.clone();
+        let s = sem.clone();
+        let p = pb.clone();
+        let st = status.clone();
         
-        let handle = tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
-            let result = scan_server(ip.clone(), port, check_auth).await;
+        tasks.push(tokio::spawn(async move {
+            let _permit = s.acquire().await.unwrap();
+            let r = scan_server(ip.clone(), port, check_auth).await;
+            p.inc(1);
             
-            // Update stats
-            let success = result.error.is_none();
-            pb.inc(1);
-            
-            if success {
-                if let Some(version) = &result.version {
-                    stats.set_message(format!(
-                        "Success: {} | {} | Players: {}/{}",
-                        ip,
-                        version,
-                        result.online_players.unwrap_or(0),
-                        result.max_players.unwrap_or(0)
-                    ));
-                } else {
-                    stats.set_message(format!("Success: {}", ip));
-                }
+            if r.error.is_none() && r.version.is_some() {
+                st.set_message(format!("Success: {} | {} | Players: {}/{}",
+                    ip, r.version.as_ref().unwrap(),
+                    r.online_players.unwrap_or(0), r.max_players.unwrap_or(0)));
             }
-            
-            result
-        });
-        
-        handles.push(handle);
+            r
+        }));
     }
     
-    // Collect all results
-    for handle in handles {
-        if let Ok(result) = handle.await {
-            results.push(result);
-        }
+    let mut results = Vec::new();
+    for t in tasks {
+        if let Ok(r) = t.await { results.push(r); }
     }
     
-    main_pb.finish_with_message("Scan complete!");
-    stats_pb.finish_and_clear();
+    pb.finish_with_message("Done!");
+    status.finish_and_clear();
     
-    // Calculate statistics
     let total = results.len();
-    let successful = results.iter().filter(|r| r.error.is_none()).count();
-    let failed = total - successful;
-    let online_mode = results.iter().filter(|r| r.auth_mode == Some(1)).count();
-    let offline_mode = results.iter().filter(|r| r.auth_mode == Some(0)).count();
-    let whitelist = results.iter().filter(|r| r.auth_mode == Some(2)).count();
+    let ok = results.iter().filter(|r| r.error.is_none()).count();
+    let online = results.iter().filter(|r| r.auth_mode == Some(1)).count();
+    let cracked = results.iter().filter(|r| r.auth_mode == Some(0)).count();
+    let wl = results.iter().filter(|r| r.auth_mode == Some(2)).count();
     
     println!();
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("📈 Scan Results:");
-    println!("   Total scanned:    {}", total);
-    println!("   ✓ Successful:     {} ({:.1}%)", successful, (successful as f32 / total as f32) * 100.0);
-    println!("   ✗ Failed:         {} ({:.1}%)", failed, (failed as f32 / total as f32) * 100.0);
+    println!("📈 Results:");
+    println!("   Total:      {}", total);
+    println!("   ✓ Success:  {} ({:.1}%)", ok, (ok as f32 / total as f32) * 100.0);
+    println!("   ✗ Failed:   {} ({:.1}%)", total - ok, ((total - ok) as f32 / total as f32) * 100.0);
     
     if check_auth {
         println!();
-        println!("🔐 Authentication Modes:");
-        println!("   🟢 Online:        {}", online_mode);
-        println!("   🟡 Offline:       {}", offline_mode);
-        println!("   🔴 Whitelist:     {}", whitelist);
+        println!("🔐 Auth:");
+        println!("   🟢 Online:    {}", online);
+        println!("   🟡 Cracked:   {}", cracked);
+        println!("   🔴 Whitelist: {}", wl);
     }
     
-    // Write results
-    let json = serde_json::to_string_pretty(&results)?;
-    tokio::fs::write("results.json", json).await?;
+    tokio::fs::write("results.json", serde_json::to_string_pretty(&results)?).await?;
     
     println!();
-    println!("💾 Results saved to: results.json");
+    println!("💾 Saved to: results.json");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     
     Ok(())
