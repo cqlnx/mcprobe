@@ -484,9 +484,9 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty() && !s.starts_with('#'))
         .collect();
     
-    println!("🔍 Minecraft Server Scanner");
+    println!("Minecraft Server Scanner");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("📊 Found {} servers to scan", lines.len());
+    println!("Found {} servers to scan", lines.len());
     println!();
     
     let check_auth = false;
@@ -544,23 +544,23 @@ async fn main() -> Result<()> {
     
     println!();
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("📈 Results:");
-    println!("   Total:      {}", total);
-    println!("   ✓ Success:  {} ({:.1}%)", ok, (ok as f32 / total as f32) * 100.0);
-    println!("   ✗ Failed:   {} ({:.1}%)", total - ok, ((total - ok) as f32 / total as f32) * 100.0);
+    println!("Results:");
+    println!("  Total:      {}", total);
+    println!("   Success:  {} ({:.1}%)", ok, (ok as f32 / total as f32) * 100.0);
+    println!("   Failed:   {} ({:.1}%)", total - ok, ((total - ok) as f32 / total as f32) * 100.0);
     
     if check_auth {
         println!();
-        println!("🔐 Auth:");
-        println!("   🟢 Online:    {}", online);
-        println!("   🟡 Cracked:   {}", cracked);
-        println!("   🔴 Whitelist: {}", wl);
+        println!("Auth:");
+        println!("    Online:    {}", online);
+        println!("    Cracked:   {}", cracked);
+        println!("    Whitelist: {}", wl);
     }
     
     tokio::fs::write("results.json", serde_json::to_string_pretty(&results)?).await?;
     
     println!();
-    println!("💾 Saved to: results.json");
+    println!("Saved to: results.json");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     
     Ok(())
