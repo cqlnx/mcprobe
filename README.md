@@ -38,15 +38,13 @@ MCprobe is designed for speed and scalability:
 - **Concurrency:** 500
 - **Auth mode detection:** true (if false up to 2x faster)
 
-### Terminal Output
-![150k scan in 8 minutes](assets/terminal.png)
-
 ## Input
 
 input.txt
 - One IP per line
 - Format: IP[:PORT]
 - If no port is provided, defaults to 25565
+- I suggest using masscan for finding ips with 25565 opened
 
 Example:
 127.0.0.1
