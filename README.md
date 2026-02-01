@@ -44,7 +44,7 @@ input.txt
 - One IP per line
 - Format: IP[:PORT]
 - If no port is provided, defaults to 25565
-- I suggest using masscan for finding ips with 25565 opened
+- U can get a list of IP's from [mcapi.shit.vc](http://mcapi.shit.vc/ips?limit=500000)
 
 Example:
 127.0.0.1
