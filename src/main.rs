@@ -10,6 +10,8 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use flate2::read::ZlibDecoder;
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::io::{self, Write};
 
 // Timeout configs
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -102,7 +104,7 @@ async fn read_varint(stream: &mut TcpStream) -> Result<i32> {
     let mut result = 0i32;
     let mut shift = 0;
     
-    for i in 0..5 {
+    for _i in 0..5 {
         let b = stream.read_u8().await?;
         result |= ((b & 0x7F) as i32) << shift;
         
@@ -261,223 +263,269 @@ fn strip_color_codes(text: &str) -> String {
 
 // Get basic server info
 async fn get_server_status(host: &str, port: u16) -> Result<ServerResponse> {
-    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-    let mut stream = timeout(DEFAULT_TIMEOUT, TcpStream::connect(addr)).await??;
-    
-    // Send handshake with high protocol so server tells us its real version
-    let handshake = create_handshake_packet(host, port, 1, MAX_PROTOCOL_VERSION);
+    let addr_str = format!("{}:{}", host, port);
+    let mut stream = timeout(DEFAULT_TIMEOUT, TcpStream::connect(&addr_str)).await??;
+
+    // Handshake (Java)
+    let handshake = create_handshake_packet(host, port, 1, 760);
     stream.write_all(&handshake).await?;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    
+    stream.write_all(&create_status_request()).await?;
     stream.flush().await?;
-    
-    // Ask for status
-    let status_req = create_status_request();
-    stream.write_all(&status_req).await?;
-    stream.flush().await?;
-    
-    // Read the response
-    let _pkt_len = read_varint(&mut stream).await?;
-    let _pkt_id = read_varint(&mut stream).await?;
-    let json_len = read_varint(&mut stream).await?;
-    
-    let mut json_data = vec![0u8; json_len as usize];
-    stream.read_exact(&mut json_data).await?;
-    
-    let response: ServerResponse = serde_json::from_slice(&json_data)?;
-    Ok(response)
+
+    timeout(Duration::from_secs(3), async {
+
+        let pkt_len = read_varint(&mut stream).await.map_err(|e| anyhow!("Read pkt len failed: {}", e))?;
+        
+
+        if pkt_len < 0 || pkt_len > 65536 {
+            return Err(anyhow!("Invalid Java packet length: {} (Likely Bedrock/UDP or Custom Proxy)", pkt_len));
+        }
+
+        let pkt_id = read_varint(&mut stream).await?;
+        if pkt_id != 0 {
+            return Err(anyhow!("Unexpected packet ID: 0x{:02X} (Not a Java Status response)", pkt_id));
+        }
+
+        let json_len = read_varint(&mut stream).await?;
+        if json_len < 0 || json_len > 65536 {
+            return Err(anyhow!("Invalid JSON payload length: {}", json_len));
+        }
+
+        let mut json_data = vec![0u8; json_len as usize];
+        stream.read_exact(&mut json_data).await?;
+
+        serde_json::from_slice(&json_data).map_err(|e| anyhow!("JSON parse error: {}", e))
+    }).await?
+}
+
+fn read_varint_slice(data: &[u8], pos: &mut usize) -> Result<i32> {
+    let mut result = 0i32;
+    let mut shift = 0;
+    for _ in 0..5 {
+        if *pos >= data.len() {
+            return Err(anyhow!("truncated varint"));
+        }
+        let b = data[*pos];
+        *pos += 1;
+        result |= ((b & 0x7F) as i32) << shift;
+        if b & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+    Err(anyhow!("varint too long"))
 }
 
 async fn get_auth_mode(host: &str, port: u16, protocol: i32) -> Result<i32> {
     if protocol < MIN_PROTOCOL_VERSION {
-        return Err(anyhow!("Protocol {} is too old, can't check", protocol));
+        return Ok(-1);
     }
-    
-    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-    let mut stream = timeout(DEFAULT_TIMEOUT, TcpStream::connect(addr)).await??;
-    
+
+    let addr_str = format!("{}:{}", host, port);
+    let mut stream = timeout(DEFAULT_TIMEOUT, TcpStream::connect(&addr_str)).await??;
+
+
     let handshake = create_handshake_packet(host, port, 2, protocol);
     stream.write_all(&handshake).await?;
     stream.flush().await?;
-    
-    let login = create_login_start("Herobrine", "00000000-0000-0000-0000-000000000000", protocol);
+
+
+    let login = create_login_start("wesdy_qq", "00000000-0000-0000-0000-000000000000", protocol);
     stream.write_all(&login).await?;
     stream.flush().await?;
-    
-    let mut compression = -1;
-    
-    let result = timeout(AUTH_TIMEOUT, async {
+
+    let is_modern = protocol >= 764; // 1.20.2+
+    let mut compression_threshold: Option<i32> = None;
+
+    timeout(AUTH_TIMEOUT, async {
         loop {
+
             let pkt_len = read_varint(&mut stream).await?;
             if pkt_len <= 0 { continue; }
-            
+
             let mut pkt_data = vec![0u8; pkt_len as usize];
             stream.read_exact(&mut pkt_data).await?;
-            
-            let pkt_bytes = if compression >= 0 {
-                let mut pos = 0;
-                let mut dlen = 0i32;
-                let mut bits = 0;
-                
-                for _ in 0..5 {
-                    if pos >= pkt_data.len() {
-                        return Err(anyhow!("bad compressed packet"));
+
+            let mut buffer = if let Some(threshold) = compression_threshold {
+                if (pkt_len as i32) > threshold {
+                    let mut pos = 0;
+                    let data_len = read_varint_from_slice(&pkt_data, &mut pos)?;
+                    if data_len == 0 {
+                        pkt_data[pos..].to_vec()
+                    } else {
+                        let mut decoder = ZlibDecoder::new(&pkt_data[pos..]);
+                        let mut out = Vec::new();
+                        decoder.read_to_end(&mut out)?;
+                        out
                     }
-                    let b = pkt_data[pos];
-                    pos += 1;
-                    dlen |= ((b & 0x7F) as i32) << bits;
-                    if b & 0x80 == 0 { break; }
-                    bits += 7;
-                }
-                
-                if dlen == 0 {
-                    pkt_data[pos..].to_vec()
                 } else {
-                    let mut decoder = ZlibDecoder::new(&pkt_data[pos..]);
-                    let mut out = Vec::new();
-                    decoder.read_to_end(&mut out)?;
-                    out
+                    pkt_data
                 }
             } else {
                 pkt_data
             };
-            
-            if pkt_bytes.is_empty() { continue; }
-            
+
+            if buffer.is_empty() { continue; }
+
             let mut pos = 0;
-            let mut id = 0i32;
-            let mut bits = 0;
-            
-            for _ in 0..5 {
-                if pos >= pkt_bytes.len() { 
-                    return Err(anyhow!("bad packet"));
-                }
-                let b = pkt_bytes[pos];
-                pos += 1;
-                id |= ((b & 0x7F) as i32) << bits;
-                if b & 0x80 == 0 { break; }
-                bits += 7;
-            }
-            
+            let id = read_varint_from_slice(&buffer, &mut pos)?;
+
             match id {
-                0x00 => {
-                    // kick/disconnect
-                    if pos < pkt_bytes.len() {
-                        let mut slen = 0i32;
-                        let mut bits = 0;
-                        for _ in 0..5 {
-                            if pos >= pkt_bytes.len() { break; }
-                            let b = pkt_bytes[pos];
-                            pos += 1;
-                            slen |= ((b & 0x7F) as i32) << bits;
-                            if b & 0x80 == 0 { break; }
-                            bits += 7;
-                        }
-                        
-                        if slen > 0 && pos + slen as usize <= pkt_bytes.len() {
-                            if let Ok(msg) = std::str::from_utf8(&pkt_bytes[pos..pos + slen as usize]) {
-                                if msg.to_lowercase().contains("whitelist") {
+                //  Encryption Request                 0x01 if !is_modern => return Ok(1),
+                0x03 if is_modern  => return Ok(1),
+
+                //  Login Success 
+                0x02 if !is_modern => return Ok(0),
+                0x00 if is_modern  => return Ok(0),
+
+                //  Disconnect / Kick 
+                _ if (id == 0x00 && !is_modern) || (id == 0x01 && is_modern) => {
+                    if pos < buffer.len() {
+                        let str_len = read_varint_from_slice(&buffer, &mut pos).unwrap_or(0);
+                        if str_len > 0 && pos + str_len as usize <= buffer.len() {
+                            if let Ok(reason) = std::str::from_utf8(&buffer[pos..pos + str_len as usize]) {
+                                if reason.to_lowercase().contains("whitelist") {
                                     return Ok(2);
                                 }
                             }
                         }
                     }
-                    return Ok(2);
+                    return Ok(2); // По умолчанию кик = вайтлист/неподходящая версия
                 }
-                0x01 => return Ok(1), // encryption = online
-                0x02 => return Ok(0), // success = cracked
-                0x03 => {
-                    // compression enabled
-                    let mut thresh = 0i32;
-                    let mut bits = 0;
-                    for _ in 0..5 {
-                        if pos >= pkt_bytes.len() { break; }
-                        let b = pkt_bytes[pos];
-                        pos += 1;
-                        thresh |= ((b & 0x7F) as i32) << bits;
-                        if b & 0x80 == 0 { break; }
-                        bits += 7;
-                    }
-                    compression = thresh;
+
+                //  Set Compression
+                _ if (id == 0x03 && !is_modern) || (id == 0x05 && is_modern) => {
+                    compression_threshold = Some(read_varint_from_slice(&buffer, &mut pos)?);
+                    continue;
                 }
-                _ => {} // ignore other packets
+
+                _ => continue, // Игнорируем плагины, задержки и прочее
             }
         }
     })
-    .await;
-    
-    match result {
-        Ok(m) => m,
-        Err(_) => Ok(-1),
-    }
+    .await
+    .unwrap_or(Ok(-1))
+}
+async fn try_login_probe(host: &str, port: u16, base_protocol: i32) -> Result<ScanResult> {
+    let addr_str = format!("{}:{}", host, port);
+    let mut stream = timeout(DEFAULT_TIMEOUT, TcpStream::connect(&addr_str)).await??;
+
+    // Handshake в состояние LOGIN (2)
+    let handshake = create_handshake_packet(host, port, 2, base_protocol);
+    stream.write_all(&handshake).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await; // Имитация задержки клиента
+
+    // Login Start
+    let login = create_login_start("RealClient", "00000000-0000-0000-0000-000000000000", base_protocol);
+    stream.write_all(&login).await?;
+    stream.flush().await?;
+
+    // Ждём ответ с таймаутом
+    timeout(AUTH_TIMEOUT, async {
+        let pkt_len = read_varint(&mut stream).await?;
+        if pkt_len <= 0 || pkt_len > 10000 { return Err(anyhow!("invalid pkt len")); }
+
+        let mut pkt_data = vec![0u8; pkt_len as usize];
+        stream.read_exact(&mut pkt_data).await?;
+
+        let mut pos = 0;
+        let id = read_varint_slice(&pkt_data, &mut pos)?;
+
+        match id {
+            0x00 => {
+                // Disconnect / Kick
+                let mut reason = "Unknown".to_string();
+                if pos < pkt_data.len() {
+                    let str_len = read_varint_slice(&pkt_data, &mut pos).unwrap_or(0);
+                    if str_len > 0 && pos + str_len as usize <= pkt_data.len() {
+                        if let Ok(json_str) = std::str::from_utf8(&pkt_data[pos..pos + str_len as usize]) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                reason = format!("Kick: {}", v.to_string());
+                            }
+                        }
+                    }
+                }
+                Ok(ScanResult {
+                    ip: host.to_string(), port,
+                    motd: None, version: Some("Protected/Proxy".to_string()),
+                    protocol: Some(base_protocol), max_players: None, online_players: None,
+                    players: None, favicon: None, auth_mode: None, error: Some(reason),
+                })
+            }
+            0x01 => {
+                Ok(ScanResult {
+                    ip: host.to_string(), port,
+                    motd: None, version: Some("Online/Protected".to_string()),
+                    protocol: Some(base_protocol), max_players: None, online_players: None,
+                    players: None, favicon: None, auth_mode: Some(1), error: None,
+                })
+            }
+            0x02 => {
+                Ok(ScanResult {
+                    ip: host.to_string(), port,
+                    motd: None, version: Some("Cracked/Unprotected".to_string()),
+                    protocol: Some(base_protocol), max_players: None, online_players: None,
+                    players: None, favicon: None, auth_mode: Some(0), error: None,
+                })
+            }
+            _ => Err(anyhow!("Unexpected login packet: 0x{:02X}", id)),
+        }
+    }).await?
 }
 
 async fn scan_server(ip: String, port: u16, check_auth: bool) -> ScanResult {
-    let scan_result = timeout(Duration::from_secs(10), async {
+    let scan_result = timeout(Duration::from_secs(12), async {
         let mut res = ScanResult {
-            ip: ip.clone(),
-            port,
-            motd: None,
-            version: None,
-            protocol: None,
-            max_players: None,
-            online_players: None,
-            players: None,
-            favicon: None,
-            auth_mode: None,
-            error: None,
+            ip: ip.clone(), port,
+            motd: None, version: None, protocol: None,
+            max_players: None, online_players: None, players: None,
+            favicon: None, auth_mode: None, error: None,
         };
-        
+
         match get_server_status(&ip, port).await {
             Ok(resp) => {
-                if let Some(v) = resp.version {
-                    res.version = Some(v.name);
-                    res.protocol = Some(v.protocol);
-                }
-                
+                if let Some(v) = resp.version { res.version = Some(v.name); res.protocol = Some(v.protocol); }
                 if let Some(p) = resp.players {
-                    res.max_players = Some(p.max);
-                    res.online_players = Some(p.online);
-                    
+                    res.max_players = Some(p.max); res.online_players = Some(p.online);
                     if let Some(sample) = p.sample {
-                        res.players = Some(
-                            sample.into_iter()
-                                .map(|p| Player { name: p.name, uuid: p.id })
-                                .collect()
-                        );
+                        res.players = Some(sample.into_iter().map(|p| Player { name: p.name, uuid: p.id }).collect());
                     }
                 }
-                
-                if let Some(d) = resp.description {
-                    res.motd = Some(parse_motd(&d));
-                }
-                
+                if let Some(d) = resp.description { res.motd = Some(parse_motd(&d)); }
                 res.favicon = resp.favicon;
-                
-                if check_auth && res.protocol.is_some() {
-                    let proto = res.protocol.unwrap();
-                    if proto >= MIN_PROTOCOL_VERSION {
-                        res.auth_mode = Some(get_auth_mode(&ip, port, proto).await.unwrap_or(-1));
-                    } else {
-                        res.auth_mode = Some(-1);
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                if err_msg.contains("not a Minecraft server") || err_msg.contains("strict firewall") || err_msg.contains("timeout") {
+                    match try_login_probe(&ip, port, 760).await {
+                        Ok(fallback) => return fallback, // Возвращаем результат из Login
+                        Err(login_err) => res.error = Some(format!("Status failed, Login also failed: {}", login_err)),
                     }
+                } else {
+                    res.error = Some(err_msg);
                 }
             }
-            Err(e) => res.error = Some(e.to_string()),
+        }
+
+        if check_auth && res.protocol.is_some() && res.error.is_none() {
+            let proto = res.protocol.unwrap();
+            if proto >= MIN_PROTOCOL_VERSION {
+                res.auth_mode = Some(get_auth_mode(&ip, port, proto).await.unwrap_or(-1));
+            } else {
+                res.auth_mode = Some(-1);
+            }
         }
         res
     }).await;
-    
+
     scan_result.unwrap_or_else(|_| ScanResult {
-        ip, port,
-        motd: None, version: None, protocol: None,
+        ip, port, motd: None, version: None, protocol: None,
         max_players: None, online_players: None, players: None,
-        favicon: None, auth_mode: None,
-        error: Some("Timeout".to_string()),
+        favicon: None, auth_mode: None, error: Some("Global Timeout".to_string()),
     })
 }
-
-#[tokio::main]
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::io::{self, Write};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -492,8 +540,8 @@ async fn main() -> Result<()> {
     println!("Found {} servers to scan", lines.len());
     println!();
     
-    let check_auth = false;
-    let max_concurrent = 500;
+    let check_auth = true;
+    let max_concurrent = 10;
 
     let counter = Arc::new(AtomicUsize::new(0));
     let total = lines.len();
@@ -518,7 +566,7 @@ async fn main() -> Result<()> {
             let scanned = c.fetch_add(1, Ordering::SeqCst) + 1;
 
             print!("\rScanned {}/{}", scanned, total);
-            io::stdout().flush().unwrap();
+            io::stdout().flush().unwrap(); 
 
             r
         }));
@@ -535,24 +583,7 @@ async fn main() -> Result<()> {
 
     let total = results.len();
     let ok = results.iter().filter(|r| r.error.is_none()).count();
-    let online = results.iter().filter(|r| r.auth_mode == Some(1)).count();
-    let cracked = results.iter().filter(|r| r.auth_mode == Some(0)).count();
-    let wl = results.iter().filter(|r| r.auth_mode == Some(2)).count();
     
-    println!();
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("Results:");
-    println!("  Total:    {}", total);
-    println!("  Success:  {} ({:.1}%)", ok, (ok as f32 / total as f32) * 100.0);
-    println!("  Failed:   {} ({:.1}%)", total - ok, ((total - ok) as f32 / total as f32) * 100.0);
-    
-    if check_auth {
-        println!();
-        println!("Auth:");
-        println!("  Online:    {}", online);
-        println!("  Cracked:   {}", cracked);
-        println!("  Whitelist: {}", wl);
-    }
     
     tokio::fs::write("results.json", serde_json::to_string_pretty(&results)?).await?;
     
@@ -561,4 +592,22 @@ async fn main() -> Result<()> {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     
     Ok(())
+}
+
+fn read_varint_from_slice(data: &[u8], pos: &mut usize) -> Result<i32> {
+    let mut result = 0i32;
+    let mut shift = 0;
+    for _ in 0..5 {
+        if *pos >= data.len() {
+            return Err(anyhow!("unexpected end of data"));
+        }
+        let b = data[*pos];
+        *pos += 1;
+        result |= ((b & 0x7F) as i32) << shift;
+        if b & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+    Err(anyhow!("varint too long"))
 }
